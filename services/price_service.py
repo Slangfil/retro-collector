@@ -26,6 +26,9 @@ class PriceService:
         return max(0, TRADERA_DAILY_LIMIT - used)
 
     def _build_query(self, item: Item) -> str:
+        if item.type == "console":
+            # "PlayStation 5 konsol" instead of "PlayStation 5 PlayStation 5"
+            return f"{item.name} konsol"
         parts = [item.name, item.platform]
         return " ".join(p for p in parts if p)
 
@@ -42,7 +45,7 @@ class PriceService:
         # Try Tradera first
         if use_tradera and self.tradera_available:
             try:
-                result = self._tradera.search_items(query)
+                result = self._tradera.search_completed_items(query)
                 if result["num_results"] > 0:
                     return PriceRecord(
                         item_id=item.id,

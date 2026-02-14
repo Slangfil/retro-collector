@@ -23,6 +23,20 @@ def _load_config() -> dict:
         return {}
 
 
+def _remove_outliers(prices: list[float]) -> list[float]:
+    """Trim the bottom and top 20% of prices to reduce noise.
+
+    Removes junk listings (accessories, broken items) from the low end
+    and bundles from the high end.
+    """
+    if len(prices) < 5:
+        return prices
+
+    sorted_p = sorted(prices)
+    trim = max(1, len(sorted_p) // 5)
+    return sorted_p[trim:-trim]
+
+
 class TraderaClient:
     def __init__(self):
         self._config = _load_config()
@@ -65,9 +79,12 @@ class TraderaClient:
         )(Sandbox=0, MaxResultAge=0)
         return [auth_header, conf_header]
 
-    def search_items(self, query: str, category_id: int = 0,
-                     max_results: int = 50) -> dict:
-        """Search for items on Tradera using the Search method.
+    def search_completed_items(self, query: str, category_id: int = 0,
+                               max_results: int = 50) -> dict:
+        """Search for completed/sold items on Tradera using SearchAdvanced.
+
+        Only includes ended auctions that had bids (i.e. actually sold).
+        MaxBid on ended items is the final sold price.
 
         Returns dict with keys: avg_price, highest_price, lowest_price,
         num_results, prices (list of individual prices).
@@ -78,14 +95,22 @@ class TraderaClient:
         client = self._get_search_client()
 
         try:
-            result = client.service.Search(
-                query=query,
-                categoryId=category_id if category_id else 0,
-                pageNumber=1,
+            result = client.service.SearchAdvanced(
+                request={
+                    "SearchWords": query,
+                    "CategoryId": category_id or 0,
+                    "ItemStatus": "Ended",
+                    "SearchInDescription": False,
+                    "OnlyAuctionsWithBuyNow": False,
+                    "OnlyItemsWithThumbnail": False,
+                    "ItemsPerPage": max_results,
+                    "PageNumber": 1,
+                    "CountyId": 0,
+                },
                 _soapheaders=self._auth_headers(client),
             )
         except Exception as e:
-            log.error(f"Tradera search failed: {e}")
+            log.error(f"Tradera SearchAdvanced failed: {e}")
             raise
 
         data = serialize_object(result)
@@ -98,9 +123,18 @@ class TraderaClient:
 
         prices = []
         for item in items[:max_results]:
-            price = item.get("MaxBid") or item.get("BuyItNowPrice") or item.get("NextBid")
+            # Only include items that actually sold (had bids and ended)
+            if not item.get("IsEnded"):
+                continue
+            if not item.get("HasBids"):
+                continue
+
+            # MaxBid on an ended auction is the final sold price
+            price = item.get("MaxBid") or item.get("BuyItNowPrice")
             if price and price > 0:
                 prices.append(float(price))
+
+        prices = _remove_outliers(prices)
 
         if not prices:
             return {

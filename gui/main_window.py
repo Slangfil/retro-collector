@@ -17,6 +17,7 @@ from db.database import (
 from db.models import Item
 from gui.collection_view import CollectionTableView
 from gui.export_dialog import ExportDialog
+from gui.import_dialog import ImportDialog
 from gui.item_dialog import ItemDialog
 from gui.price_panel import PricePanel
 from services.price_service import PriceService
@@ -82,6 +83,10 @@ class MainWindow(QMainWindow):
         self.refresh_prices_btn = QPushButton("Refresh Prices")
         self.refresh_prices_btn.clicked.connect(self._on_bulk_refresh)
         toolbar_layout.addWidget(self.refresh_prices_btn)
+
+        self.import_btn = QPushButton("Import Photos")
+        self.import_btn.clicked.connect(self._on_import_photos)
+        toolbar_layout.addWidget(self.import_btn)
 
         toolbar_layout.addStretch()
         main_layout.addLayout(toolbar_layout)
@@ -260,6 +265,15 @@ class MainWindow(QMainWindow):
             self._populate_platform_filter()
             # Auto price lookup for new items
             self._start_price_lookup(dlg.item)
+
+    def _on_import_photos(self):
+        dlg = ImportDialog(self.conn, parent=self)
+        dlg.items_imported.connect(self._on_import_done)
+        dlg.exec()
+
+    def _on_import_done(self):
+        self.table_view.refresh()
+        self._populate_platform_filter()
 
     def _on_edit_item(self, item: Item):
         fresh = get_item(self.conn, item.id)
