@@ -1,15 +1,14 @@
 """QThread worker for running game detection off the main thread.
 
 Follows the PriceLookupWorker pattern from main_window.py.
-Creates the GameDetector (and thus EasyOCR model) inside run() so
-everything lives on the worker thread.
+Creates the GameDetector inside run() so everything lives on the worker thread.
 """
 
 from PySide6.QtCore import QThread, Signal
 
 
 class DetectionWorker(QThread):
-    """Runs OCR + fuzzy matching on a batch of images."""
+    """Sends a batch of images to the Claude vision API for game detection."""
 
     progress = Signal(int, int, str)   # (current, total, filename)
     model_loading = Signal()
@@ -26,7 +25,6 @@ class DetectionWorker(QThread):
             self.model_loading.emit()
             from services.game_detector import GameDetector
             detector = GameDetector()
-            # Force model load so we can signal when it's ready
             detector._ensure_reader()
             self.model_loaded.emit()
 

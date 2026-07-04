@@ -6,12 +6,12 @@ import uuid
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QCursor, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-    QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
-    QWidget, QAbstractItemView,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
+    QPushButton, QScrollArea, QSplitter, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
 from db.database import add_image, add_item, get_all_platforms
@@ -106,12 +106,31 @@ class ImportDialog(QDialog):
         self.table.currentCellChanged.connect(self._on_row_changed)
         splitter.addWidget(self.table)
 
-        # Detail panel
+        # Detail panel — image on the left, AI info on the right
         detail_widget = QWidget()
-        detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.setContentsMargins(4, 4, 4, 4)
+        detail_outer = QHBoxLayout(detail_widget)
+        detail_outer.setContentsMargins(4, 4, 4, 4)
+        detail_outer.setSpacing(8)
 
-        self.ocr_label = QLabel("OCR text:")
+        # Left: large image preview (click to zoom)
+        self.detail_image = QLabel("No image")
+        self.detail_image.setAlignment(Qt.AlignCenter)
+        self.detail_image.setFixedSize(180, 160)
+        self.detail_image.setStyleSheet(
+            "background: #1e1e2e; border: 1px solid #45475a; border-radius: 4px;"
+            "color: #585b70;"
+        )
+        self.detail_image.setCursor(QCursor(Qt.PointingHandCursor))
+        self.detail_image.mousePressEvent = self._on_preview_click
+        self._detail_image_path: str = ""
+        detail_outer.addWidget(self.detail_image)
+
+        # Right: AI response + alternatives
+        info_widget = QWidget()
+        detail_layout = QVBoxLayout(info_widget)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.ocr_label = QLabel("AI response:")
         self.ocr_label.setStyleSheet("font-weight: bold;")
         detail_layout.addWidget(self.ocr_label)
 
@@ -127,6 +146,9 @@ class ImportDialog(QDialog):
         self.alt_text = QLabel("")
         self.alt_text.setWordWrap(True)
         detail_layout.addWidget(self.alt_text)
+        detail_layout.addStretch()
+
+        detail_outer.addWidget(info_widget, 1)
 
         splitter.addWidget(detail_widget)
         splitter.setStretchFactor(0, 3)
@@ -249,15 +271,15 @@ class ImportDialog(QDialog):
         self.progress_label.setVisible(True)
         self.progress_bar.setMaximum(len(self._image_paths))
         self.progress_bar.setValue(0)
-        self.progress_label.setText("Loading OCR model...")
+        self.progress_label.setText("Connecting to Claude API...")
 
         from gui.detection_worker import DetectionWorker
         self._worker = DetectionWorker(self._image_paths)
         self._worker.model_loading.connect(
-            lambda: self.progress_label.setText("Loading OCR model (first time may download ~100MB)...")
+            lambda: self.progress_label.setText("Connecting to Claude API...")
         )
         self._worker.model_loaded.connect(
-            lambda: self.progress_label.setText("Model loaded. Starting detection...")
+            lambda: self.progress_label.setText("Connected. Starting detection...")
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_detection_finished)
@@ -343,6 +365,25 @@ class ImportDialog(QDialog):
             return
         self._detail_row = row
 
+        # Image preview
+        if row < len(self._image_paths):
+            path = self._image_paths[row]
+            self._detail_image_path = path
+            pm = QPixmap(path).scaled(
+                180, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            if not pm.isNull():
+                self.detail_image.setPixmap(pm)
+                self.detail_image.setToolTip("Click to zoom")
+            else:
+                self.detail_image.clear()
+                self.detail_image.setText("?")
+                self.detail_image.setToolTip("")
+        else:
+            self.detail_image.clear()
+            self.detail_image.setText("No image")
+            self._detail_image_path = ""
+
         result = self._results[row]
         self.ocr_text.setPlainText(result.raw_ocr_text or "(no text detected)")
 
@@ -354,6 +395,12 @@ class ImportDialog(QDialog):
             self.alt_text.setText(" | ".join(parts))
         else:
             self.alt_text.setText("(none)")
+
+    def _on_preview_click(self, _event):
+        if not self._detail_image_path:
+            return
+        dlg = _PhotoZoomDialog(self._detail_image_path, parent=self)
+        dlg.exec()
 
     # --- Save ---
 
@@ -430,3 +477,42 @@ class ImportDialog(QDialog):
                 f"Successfully imported {saved} item(s).",
             )
             self.accept()
+
+
+class _PhotoZoomDialog(QDialog):
+    """Full-size photo viewer — click anywhere or press Escape to close."""
+
+    def __init__(self, image_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Photo Preview")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
+
+        screen = self.screen().availableGeometry()
+        max_w = int(screen.width() * 0.85)
+        max_h = int(screen.height() * 0.85)
+
+        pm = QPixmap(image_path)
+        if not pm.isNull() and (pm.width() > max_w or pm.height() > max_h):
+            pm = pm.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignCenter)
+        if not pm.isNull():
+            img_label.setPixmap(pm)
+            self.resize(pm.width(), pm.height())
+        else:
+            img_label.setText("Could not load image")
+            self.resize(400, 300)
+
+        scroll = QScrollArea()
+        scroll.setWidget(img_label)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.NoFrame)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)

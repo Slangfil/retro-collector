@@ -2,12 +2,14 @@ import sqlite3
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from db.database import get_latest_price
-from db.models import Item, PriceRecord
+from db.models import PriceRecord
 
 
 class PricePanel(QWidget):
@@ -17,6 +19,7 @@ class PricePanel(QWidget):
         super().__init__(parent)
         self.conn = conn
         self._current_item_id: Optional[int] = None
+        self._current_notes: str = ""
         self._build_ui()
 
     def _build_ui(self):
@@ -26,40 +29,76 @@ class PricePanel(QWidget):
         group = QGroupBox("Price Information")
         glayout = QVBoxLayout(group)
 
+        # Source + date row
+        top_row = QHBoxLayout()
         self.source_label = QLabel("Source: -")
-        glayout.addWidget(self.source_label)
+        top_row.addWidget(self.source_label)
+        top_row.addStretch()
+        self.fetched_label = QLabel("")
+        self.fetched_label.setStyleSheet("color: gray; font-size: 11px;")
+        top_row.addWidget(self.fetched_label)
+        glayout.addLayout(top_row)
 
-        self.avg_label = QLabel("Average: -")
-        self.avg_label.setStyleSheet("font-size: 14px; font-weight: bold;")
-        glayout.addWidget(self.avg_label)
+        # Three-column price display: Low | Median/Avg | High
+        price_row = QHBoxLayout()
 
-        self.high_label = QLabel("Highest: -")
-        glayout.addWidget(self.high_label)
+        self._low_box   = self._make_price_col("Low")
+        self._mid_box   = self._make_price_col("Median")
+        self._high_box  = self._make_price_col("High")
 
-        self.low_label = QLabel("Lowest: -")
-        glayout.addWidget(self.low_label)
+        price_row.addWidget(self._low_box["widget"])
+        price_row.addWidget(self._mid_box["widget"])
+        price_row.addWidget(self._high_box["widget"])
+        glayout.addLayout(price_row)
 
-        self.results_label = QLabel("Results: -")
+        # Num results (Tradera/eBay only)
+        self.results_label = QLabel("")
+        self.results_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.results_label.setVisible(False)
         glayout.addWidget(self.results_label)
 
-        self.fetched_label = QLabel("Last checked: -")
-        self.fetched_label.setStyleSheet("color: gray;")
-        glayout.addWidget(self.fetched_label)
+        # Buttons
+        btn_row = QHBoxLayout()
 
-        btn_layout = QHBoxLayout()
+        self.analysis_btn = QPushButton("Analysis…")
+        self.analysis_btn.setEnabled(False)
+        self.analysis_btn.setToolTip("Read the agent's full pricing analysis")
+        self.analysis_btn.clicked.connect(self._on_analysis)
+        btn_row.addWidget(self.analysis_btn)
+
+        btn_row.addStretch()
+
         self.refresh_btn = QPushButton("Refresh Price")
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.clicked.connect(self._on_refresh)
-        btn_layout.addWidget(self.refresh_btn)
-        btn_layout.addStretch()
-        glayout.addLayout(btn_layout)
+        btn_row.addWidget(self.refresh_btn)
 
+        glayout.addLayout(btn_row)
         layout.addWidget(group)
+
+    @staticmethod
+    def _make_price_col(header: str) -> dict:
+        """Return a dict with 'widget', 'header_lbl', 'value_lbl'."""
+        col = QWidget()
+        col_layout = QVBoxLayout(col)
+        col_layout.setContentsMargins(4, 4, 4, 4)
+        col_layout.setSpacing(2)
+
+        h = QLabel(header)
+        h.setAlignment(Qt.AlignCenter)
+        h.setStyleSheet("color: gray; font-size: 11px;")
+
+        v = QLabel("-")
+        v.setAlignment(Qt.AlignCenter)
+        v.setStyleSheet("font-size: 15px; font-weight: bold;")
+
+        col_layout.addWidget(h)
+        col_layout.addWidget(v)
+        return {"widget": col, "header_lbl": h, "value_lbl": v}
 
     def update_for_item(self, item_id: int):
         self._current_item_id = item_id
         self.refresh_btn.setEnabled(True)
-
         price = get_latest_price(self.conn, item_id)
         if price:
             self._show_price(price)
@@ -67,32 +106,54 @@ class PricePanel(QWidget):
             self._show_empty()
 
     def _show_price(self, price: PriceRecord):
-        self.source_label.setText(f"Source: {price.source.capitalize()}")
-        if price.avg_price is not None:
-            self.avg_label.setText(f"Average: {int(price.avg_price)} {price.currency}")
+        is_claude = price.source == "claude"
+
+        # Source label
+        source_name = {"claude": "Claude AI", "tradera": "Tradera", "ebay": "eBay"}.get(
+            price.source, price.source.capitalize()
+        )
+        self.source_label.setText(f"Source: {source_name}")
+
+        # Date
+        self.fetched_label.setText(
+            f"checked {price.fetched_at}" if price.fetched_at else ""
+        )
+
+        # Middle column label: "Median" for Claude, "Average" for others
+        self._mid_box["header_lbl"].setText("Median" if is_claude else "Average")
+
+        # Populate values
+        cur = price.currency or "SEK"
+        self._low_box["value_lbl"].setText(
+            f"{int(price.lowest_price)} {cur}" if price.lowest_price is not None else "-"
+        )
+        self._mid_box["value_lbl"].setText(
+            f"{int(price.avg_price)} {cur}" if price.avg_price is not None else "-"
+        )
+        self._high_box["value_lbl"].setText(
+            f"{int(price.highest_price)} {cur}" if price.highest_price is not None else "-"
+        )
+
+        # Results count (Tradera/eBay only)
+        if not is_claude and price.num_results:
+            self.results_label.setText(f"Based on {price.num_results} listings")
+            self.results_label.setVisible(True)
         else:
-            self.avg_label.setText("Average: -")
-        if price.highest_price is not None:
-            self.high_label.setText(f"Highest: {int(price.highest_price)} {price.currency}")
-        else:
-            self.high_label.setText("Highest: -")
-        if price.lowest_price is not None:
-            self.low_label.setText(f"Lowest: {int(price.lowest_price)} {price.currency}")
-        else:
-            self.low_label.setText("Lowest: -")
-        self.results_label.setText(f"Results: {price.num_results}")
-        if price.fetched_at:
-            self.fetched_label.setText(f"Last checked: {price.fetched_at}")
-        else:
-            self.fetched_label.setText("Last checked: just now")
+            self.results_label.setVisible(False)
+
+        # Analysis button
+        self._current_notes = price.notes or ""
+        self.analysis_btn.setEnabled(bool(self._current_notes))
 
     def _show_empty(self):
         self.source_label.setText("Source: -")
-        self.avg_label.setText("Average: No price data")
-        self.high_label.setText("Highest: -")
-        self.low_label.setText("Lowest: -")
-        self.results_label.setText("Results: -")
-        self.fetched_label.setText("Last checked: -")
+        self.fetched_label.setText("")
+        self._mid_box["header_lbl"].setText("Median")
+        for box in (self._low_box, self._mid_box, self._high_box):
+            box["value_lbl"].setText("-")
+        self.results_label.setVisible(False)
+        self._current_notes = ""
+        self.analysis_btn.setEnabled(False)
 
     def clear(self):
         self._current_item_id = None
@@ -102,3 +163,36 @@ class PricePanel(QWidget):
     def _on_refresh(self):
         if self._current_item_id is not None:
             self.refresh_requested.emit(self._current_item_id)
+
+    def _on_analysis(self):
+        if not self._current_notes:
+            return
+        dlg = AnalysisDialog(self._current_notes, parent=self)
+        dlg.exec()
+
+
+class AnalysisDialog(QDialog):
+    """Displays the Claude agent's full markdown price analysis."""
+
+    def __init__(self, markdown_text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Price Analysis")
+        self.setMinimumSize(640, 480)
+        self.resize(700, 540)
+
+        layout = QVBoxLayout(self)
+
+        browser = QTextBrowser()
+        browser.setOpenLinks(False)
+        browser.anchorClicked.connect(
+            lambda url: QDesktopServices.openUrl(url)
+        )
+        try:
+            browser.document().setMarkdown(markdown_text)
+        except Exception:
+            browser.setPlainText(markdown_text)
+        layout.addWidget(browser)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)

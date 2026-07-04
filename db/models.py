@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 
+
 @dataclass
 class Item:
     id: Optional[int] = None
@@ -29,13 +30,14 @@ class ItemImage:
 class PriceRecord:
     id: Optional[int] = None
     item_id: int = 0
-    source: str = ""  # 'tradera' or 'ebay'
-    avg_price: Optional[float] = None
+    source: str = ""  # 'tradera', 'ebay', or 'claude'
+    avg_price: Optional[float] = None   # median for claude source
     highest_price: Optional[float] = None
     lowest_price: Optional[float] = None
     currency: str = "SEK"
     num_results: int = 0
     fetched_at: Optional[datetime] = None
+    notes: str = ""  # full markdown analysis (claude source)
 
 
 @dataclass

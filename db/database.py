@@ -58,7 +58,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             lowest_price REAL,
             currency TEXT DEFAULT 'SEK',
             num_results INTEGER,
-            fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
         );
 
         CREATE TABLE IF NOT EXISTS platforms (
@@ -72,6 +73,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO platforms (name) VALUES (?)", (name,)
         )
     conn.commit()
+
+    # Migrations for existing databases
+    try:
+        conn.execute("ALTER TABLE price_records ADD COLUMN notes TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
 
 
 # --- Item CRUD ---
@@ -215,10 +223,11 @@ def update_image_order(conn: sqlite3.Connection, image_id: int, sort_order: int)
 def add_price_record(conn: sqlite3.Connection, record: PriceRecord) -> int:
     cur = conn.execute(
         """INSERT INTO price_records
-           (item_id, source, avg_price, highest_price, lowest_price, currency, num_results)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (item_id, source, avg_price, highest_price, lowest_price, currency, num_results, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (record.item_id, record.source, record.avg_price, record.highest_price,
-         record.lowest_price, record.currency, record.num_results),
+         record.lowest_price, record.currency, record.num_results,
+         record.notes or None),
     )
     conn.commit()
     return cur.lastrowid
@@ -236,6 +245,7 @@ def get_latest_price(conn: sqlite3.Connection, item_id: int) -> Optional[PriceRe
         avg_price=row["avg_price"], highest_price=row["highest_price"],
         lowest_price=row["lowest_price"], currency=row["currency"],
         num_results=row["num_results"], fetched_at=row["fetched_at"],
+        notes=row["notes"] or "",
     )
 
 
@@ -250,6 +260,7 @@ def get_price_history(conn: sqlite3.Connection, item_id: int) -> list[PriceRecor
             avg_price=r["avg_price"], highest_price=r["highest_price"],
             lowest_price=r["lowest_price"], currency=r["currency"],
             num_results=r["num_results"], fetched_at=r["fetched_at"],
+            notes=r["notes"] or "",
         )
         for r in rows
     ]
@@ -279,3 +290,20 @@ def add_platform(conn: sqlite3.Connection, name: str) -> int:
 def delete_platform(conn: sqlite3.Connection, platform_id: int) -> None:
     conn.execute("DELETE FROM platforms WHERE id=?", (platform_id,))
     conn.commit()
+
+
+def get_orphan_images(conn: sqlite3.Connection, images_dir: Path) -> list[Path]:
+    """Return image files in images_dir that are NOT referenced by any item.
+
+    These are safe to delete — they are not used as thumbnails by any collection item.
+    """
+    if not images_dir.exists():
+        return []
+    tracked = {
+        row[0]
+        for row in conn.execute("SELECT image_path FROM item_images").fetchall()
+    }
+    return sorted(
+        f for f in images_dir.iterdir()
+        if f.is_file() and f.name not in tracked
+    )
