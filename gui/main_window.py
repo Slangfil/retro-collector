@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from db.database import (
     delete_item, get_all_platforms, get_images_for_item, get_item,
-    get_primary_image, toggle_for_sale,
+    get_orphan_images, get_primary_image, toggle_for_sale,
 )
 from db.models import Item
 from gui.collection_view import CollectionTableView
@@ -33,18 +33,14 @@ class PriceLookupWorker(QThread):
     finished = Signal(object)  # PriceRecord or None
     error = Signal(str)
 
-    def __init__(self, price_service: PriceService, item: Item,
-                 use_tradera: bool = True):
+    def __init__(self, price_service: PriceService, item: Item):
         super().__init__()
         self.price_service = price_service
         self.item = item
-        self.use_tradera = use_tradera
 
     def run(self):
         try:
-            result = self.price_service.lookup_price(
-                self.item, use_tradera=self.use_tradera,
-            )
+            result = self.price_service.lookup_price(self.item)
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -87,6 +83,14 @@ class MainWindow(QMainWindow):
         self.import_btn = QPushButton("Import Photos")
         self.import_btn.clicked.connect(self._on_import_photos)
         toolbar_layout.addWidget(self.import_btn)
+
+        self.cleanup_btn = QPushButton("Clean Image Inbox")
+        self.cleanup_btn.clicked.connect(self._on_cleanup_images)
+        toolbar_layout.addWidget(self.cleanup_btn)
+
+        self.dedup_btn = QPushButton("Remove Duplicates")
+        self.dedup_btn.clicked.connect(self._on_remove_duplicates)
+        toolbar_layout.addWidget(self.dedup_btn)
 
         toolbar_layout.addStretch()
         main_layout.addLayout(toolbar_layout)
@@ -208,8 +212,8 @@ class MainWindow(QMainWindow):
             self.platform_filter.addItem(p.name)
 
     def _update_status_bar(self):
-        remaining = self.price_service.tradera_calls_remaining()
-        self.api_status_label.setText(f"Tradera API: {remaining}/100 calls remaining today")
+        count = self.table_view.model().rowCount()
+        self.api_status_label.setText(f"{count} item(s)")
 
     def _on_search_changed(self, text):
         self.table_view.proxy_model.set_search(text)
@@ -274,6 +278,50 @@ class MainWindow(QMainWindow):
     def _on_import_done(self):
         self.table_view.refresh()
         self._populate_platform_filter()
+
+    def _on_cleanup_images(self):
+        from gui.cleanup_dialog import CleanupDialog
+
+        orphans = get_orphan_images(self.conn, IMAGES_DIR)
+        if not orphans:
+            QMessageBox.information(
+                self, "Nothing to Clean",
+                "No unlinked image files found — all images in the folder "
+                "are used as thumbnails by the collection.",
+            )
+            return
+
+        dlg = CleanupDialog(orphans, parent=self)
+        if dlg.exec() == CleanupDialog.Accepted and dlg.deleted_count:
+            QMessageBox.information(
+                self, "Cleanup Done",
+                f"Deleted {dlg.deleted_count} unlinked image file(s).",
+            )
+
+    def _on_remove_duplicates(self):
+        from gui.dedup_dialog import DedupDialog, find_duplicate_groups
+        groups = find_duplicate_groups(self.conn, IMAGES_DIR)
+        if not groups:
+            QMessageBox.information(self, "No Duplicates", "No duplicate items found.")
+            return
+        dlg = DedupDialog(self.conn, groups, parent=self)
+        if dlg.exec() == DedupDialog.Accepted and dlg.deleted_count:
+            self.table_view.refresh()
+            if self._selected_item:
+                fresh = get_item(self.conn, self._selected_item.id)
+                if fresh:
+                    self._on_item_selected(fresh)
+                else:
+                    self._selected_item = None
+                    self.detail_title.setText("Select an item")
+                    self.detail_image.clear()
+                    self.edit_btn.setEnabled(False)
+                    self.delete_btn.setEnabled(False)
+                    self.sale_btn.setEnabled(False)
+            QMessageBox.information(
+                self, "Done",
+                f"Deleted {dlg.deleted_count} duplicate item(s).",
+            )
 
     def _on_edit_item(self, item: Item):
         fresh = get_item(self.conn, item.id)
@@ -348,11 +396,7 @@ class MainWindow(QMainWindow):
 
     def _start_price_lookup(self, item: Item):
         self.status_bar.showMessage(f"Looking up price for '{item.name}'...", 0)
-        # Check quota on the main thread (DB access) before spawning worker
-        use_tradera = (self.price_service.tradera_available
-                       and self.price_service.tradera_calls_remaining() > 0)
-        worker = PriceLookupWorker(self.price_service, item,
-                                   use_tradera=use_tradera)
+        worker = PriceLookupWorker(self.price_service, item)
         worker.finished.connect(lambda result: self._on_price_result(item, result))
         worker.error.connect(lambda err: self._on_price_error(item, err))
         worker.finished.connect(lambda: self._cleanup_worker(worker))
@@ -367,9 +411,11 @@ class MainWindow(QMainWindow):
         self.table_view.refresh()
         self._update_status_bar()
         if result:
+            mid = int(result.avg_price) if result.avg_price else "?"
+            label = "median" if result.source == "claude" else "avg"
             self.status_bar.showMessage(
-                f"Price for '{item.name}': {int(result.avg_price)} {result.currency} avg "
-                f"({result.num_results} results from {result.source})", 5000,
+                f"Price for '{item.name}': {mid} {result.currency} {label} "
+                f"(via {result.source})", 5000,
             )
         else:
             self.status_bar.showMessage(f"No price data found for '{item.name}'", 5000)
@@ -392,12 +438,11 @@ class MainWindow(QMainWindow):
         if not items:
             QMessageBox.information(self, "No Selection", "Select items to refresh prices for.")
             return
-        if len(items) > 50:
-            remaining = self.price_service.tradera_calls_remaining()
-            reply = QMessageBox.warning(
-                self, "Large Batch",
-                f"You selected {len(items)} items. "
-                f"Tradera API has {remaining} calls remaining today.\n\n"
+        if len(items) > 20:
+            reply = QMessageBox.question(
+                self, "Refresh Prices",
+                f"This will ask Claude to look up prices for {len(items)} items.\n"
+                f"Each lookup takes a few seconds and costs a small amount.\n\n"
                 f"Continue?",
                 QMessageBox.Yes | QMessageBox.No,
             )
